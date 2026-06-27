@@ -37,6 +37,9 @@
 #include "esp_crt_bundle.h"
 #include "esp_sntp.h"
 
+#include "cJSON.h"
+#include <time.h>
+
 #define LED_GPIO 38
 
 #define MAX_HTTP_RECV_BUFFER 512
@@ -55,6 +58,12 @@ static const char *TARGET_SSID = "ASK4 Wireless";
 /* How many disconnects before we give up. */
 #define MAX_RETRY 5
 static int s_retry = 0;
+
+typedef struct schedule {
+	time_t start;
+	uint32_t duration;
+} schedule_t;
+static schedule_t curr_schedule;
 
 esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
@@ -113,7 +122,18 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
                     }
                 }
                 output_len += copy_len;
-            }
+            }else{
+				if (evt->user_data) {
+			        if (output_len == 0) {
+			            memset(evt->user_data, 0, MAX_HTTP_OUTPUT_BUFFER);
+			        }
+			        int copy_len = MIN(evt->data_len, MAX_HTTP_OUTPUT_BUFFER - output_len);
+			        if (copy_len > 0) {
+			            memcpy((char *)evt->user_data + output_len, evt->data, copy_len);
+			            output_len += copy_len;
+			        }
+			    }
+			}
 
             break;
         case HTTP_EVENT_ON_FINISH:
@@ -181,6 +201,64 @@ static void event_handler(void *arg, esp_event_base_t base,
         s_retry = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
+}
+
+static time_t iso8601_to_unix(const char *iso)
+{
+    struct tm tm = {0};
+    int year, mon, mday, hour, min, sec;
+
+    if (sscanf(iso, "%d-%d-%dT%d:%d:%d",
+               &year, &mon, &mday, &hour, &min, &sec) != 6) {
+        return (time_t)-1;   // parse failure
+    }
+
+    tm.tm_year = year - 1900;
+    tm.tm_mon  = mon  - 1;
+    tm.tm_mday = mday;
+    tm.tm_hour = hour;
+    tm.tm_min  = min;
+    tm.tm_sec  = sec;
+
+    return timegm(&tm);   // interpret as UTC (the trailing Z)
+}
+
+static void parse_schedule(const char *json, schedule_t *schedule)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (root == NULL) {
+        ESP_LOGE(TAG, "JSON parse failed: %s",
+                 cJSON_GetErrorPtr() ? cJSON_GetErrorPtr() : "?");
+        return;
+    }
+
+    cJSON *id    = cJSON_GetObjectItem(root, "id");
+    cJSON *start = cJSON_GetObjectItem(root, "start");
+    cJSON *dur   = cJSON_GetObjectItem(root, "durationSec");
+
+    const char *id_str    = cJSON_IsString(id)    ? id->valuestring    : "?";
+    const char *start_str = cJSON_IsString(start) ? start->valuestring : "?";
+    int duration_sec      = cJSON_IsNumber(dur)   ? dur->valueint      : 0;
+
+    ESP_LOGI(TAG, "id=%s start=%s durationSec=%d",
+             id_str, start_str, duration_sec);
+	
+	schedule->start = iso8601_to_unix(start->valuestring);
+	schedule->duration = dur->valueint;
+
+    cJSON_Delete(root);
+}
+
+static void print_rtc(void)
+{
+    time_t now = 0;
+    struct tm timeinfo = {0};
+    time(&now);
+    localtime_r(&now, &timeinfo);   // gmtime_r for UTC
+
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ESP_LOGI(TAG, "RTC: %s (epoch %lld)", buf, (long long)now);
 }
 
 static void sync_time(void)
@@ -291,13 +369,13 @@ static void scan_task(void *pv)
     vTaskDelete(NULL);   /* one-shot task */
 }
 
-static void http_test_task2(void *pv)
+static void get_schedule(void *pv)
 {
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
 	char resp[MAX_HTTP_OUTPUT_BUFFER + 1] = {0};
     esp_http_client_config_t config = {
-        .url = "https://www.howsmyssl.com/a/check",
+        .url = "https://ardenpalme.com/api/garden",
         .event_handler = _http_event_handler,
         .user_data = resp,
         .timeout_ms = 5000,
@@ -307,12 +385,14 @@ static void http_test_task2(void *pv)
 
 	sync_time();
     /* API key as a header — set before perform() */
-//	esp_http_client_set_header(client, "X-API-Key", "YOUR_API_KEY");
-
+	esp_http_client_set_header(client, "X-API-Key", "cU40m36H4kzZUH7y");
+	
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "status %d, body: %s",
                  esp_http_client_get_status_code(client), resp);
+		parse_schedule(resp, &curr_schedule);
+		print_rtc();
     } else {
         ESP_LOGE(TAG, "GET failed: %s", esp_err_to_name(err));
     }
@@ -350,6 +430,6 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 	
 	wifi_init();
-	xTaskCreate(http_test_task2, "http", 8192, NULL, 5, NULL);
+	xTaskCreate(get_schedule, "http", 8192, NULL, 5, NULL);
 	xTaskCreate(scan_task, "scan_task", 4096, NULL, 5, NULL);
 }
